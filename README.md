@@ -1,11 +1,13 @@
-# Custom AlmaLinux Installer with ZFS Root, KVM Hypervisor, and Secure Boot
+# Custom AlmaLinux Installer with ZFS Root, KVM Hypervisor, Secure Boot, and Open vSwitch Networking
 
 This document outlines the steps required to build a custom AlmaLinux ISO that:
 
 - Supports installing the root filesystem on ZFS, including ZFS RAID features.
 - Allows filesystem, RAID level, and encryption selection via the installer GUI.
 - Installs and configures a KVM hypervisor with encrypted storage pools.
+- Uses Open vSwitch (OVS) for virtualized networking.
 - Includes signed ZFS kernel modules to enable boot with Secure Boot (similar to Proxmox).
+- Provides a web-based management UI using Cockpit with KVM support.
 
 ---
 
@@ -17,12 +19,16 @@ This document outlines the steps required to build a custom AlmaLinux ISO that:
    sudo dnf install -y lorax-composer rpm-build mock \
                        dracut-devel pesign mokutil git wget \
                        anaconda-blivet-gui python3-blivet-gui python3-pykickstart \
-                       @virtualization qemu-kvm libvirt libvirt-client virt-install
+                       @virtualization qemu-kvm libvirt libvirt-client virt-install \
+                       cockpit cockpit-machines cockpit-networkmanager openvswitch
    ```
-3. **Enable and Start libvirtd**:
+
+3. **Enable and Start Services**:
 
    ```bash
    sudo systemctl enable --now libvirtd.socket
+   sudo systemctl enable --now cockpit.socket
+   sudo systemctl enable --now openvswitch.service
    ```
 4. **Generate Signing Keys**:
 
@@ -61,9 +67,10 @@ This document outlines the steps required to build a custom AlmaLinux ISO that:
 
 To allow module loading under Secure Boot, the `.ko` files must be signed.
 
-1. **Install and Extract Modules**:
+1. **Extract Modules**:
 
    ```bash
+   mkdir -p /tmp/zfs-modules
    find /usr/lib/modules/$(uname -r) -type f \
      -name 'zfs*.ko' -o -name 'spl*.ko' \
      -exec cp --parents {} /tmp/zfs-modules/ \;
@@ -78,43 +85,41 @@ To allow module loading under Secure Boot, the `.ko` files must be signed.
    ```
 3. **Automate Signing in Dracut**:
 
-   * Create a Dracut module in `/usr/lib/dracut/modules.d/95zfs-sign/` that hooks into `install_modules()` to sign all ZFS modules during initramfs creation.
+   * Create a Dracut module under `/usr/lib/dracut/modules.d/95zfs-sign/` that signs ZFS modules in `install_modules()`.
 
 ---
 
 ## 4. Customize Installer GUI for ZFS, RAID, and Encryption
 
-To let users select ZFS filesystem, RAID levels, and LUKS or ZFS native encryption in Anaconda:
+To allow users to select ZFS, RAID RAID levels, and encryption in Anaconda:
 
-1. **Install Blivet GUI and Kickstart Packages**:
+1. **Install Blivet GUI and Cryptsetup**:
 
    ```bash
    sudo dnf install -y anaconda-blivet-gui python3-blivet-gui python3-pykickstart cryptsetup
    ```
 2. **Extend Blivet Plugin**:
 
-   * In `anaconda/pyanaconda/blivet_plugins/`, update `zfs_plugin.py` to register:
+   * Add `zfs_plugin.py` to `anaconda/pyanaconda/blivet_plugins/` that registers:
 
      * **Filesystem**: ZFS
-     * **RAID Levels**: mirror, raidz, raidz2, raidz3
-     * **Encryption Options**: LUKS (via `cryptsetup`) or ZFS native encryption (`encryption=on`)
-   * Map GUI selections (\$fs\_type, \$raid\_level, \$encrypt\_type) to Kickstart variables.
-3. **Modify Anaconda UI Layout**:
+     * **RAID Levels**: single, mirror, raidz, raidz2, raidz3
+     * **Encryption Options**: LUKS or ZFS native encryption
+   * Map GUI choices (`$fs_type`, `$raid_level`, `$encrypt_type`) to Kickstart variables.
+3. **Modify UI Layout**:
 
-   * Add dropdown menus for filesystem, RAID, and encryption under `/usr/share/anaconda/ui/target.blivet` or companion XML.
+   * Update `/usr/share/anaconda/ui/target.blivet` or corresponding XML to include dropdowns for filesystem, RAID, and encryption when ZFS is selected.
 4. **Test GUI**:
 
    ```bash
    anaconda --testmode --storage-only
    ```
 
-   * Verify “ZFS”, RAID, and “Encrypt with LUKS/ZFS” options appear and produce correct storage definitions.
-
 ---
 
-## 5. Create a Kickstart Configuration for ZFS with Encryption and KVM
+## 5. Create a Kickstart Configuration for ZFS with Encryption, KVM, and Open vSwitch
 
-Use a Kickstart file (`ks.cfg`) to automate pool creation, encryption, and hypervisor setup.
+Use a Kickstart file (`ks.cfg`) to automate ZFS pool creation, encryption, hypervisor setup, and OVS networking.
 
 ```kickstart
 zerombr
@@ -124,6 +129,10 @@ bootloader --location=mbr
 %packages
 @^minimal
 @virtualization
+cockpit
+cockpit-machines
+cockpit-networkmanager
+openvswitch
 anaconda-blivet-gui
 zfs
 zfs-dkms
@@ -132,16 +141,17 @@ cryptsetup
 %end
 
 %pre --interpreter=/usr/bin/bash
-# GUI-provided variables: $raid_level, $encrypt_type (luks|zfs), $vm_storage
+# Variables from GUI plugin: $raid_level, $encrypt_type (luks|zfs)
 ZPOOL_OPTS="-o ashift=12 -O compression=lz4 -O atime=off"
-DEVICES=(/dev/vda1 /dev/vdb1)
+DEVICE_LIST=(/dev/vda1 /dev/vdb1)
 case "$raid_level" in
+  single) STRAT="single";;
   mirror) STRAT="mirror";;
   raidz)  STRAT="raidz";;
   raidz2) STRAT="raidz2";;
-  *)      STRAT="single";;
+  raidz3) STRAT="raidz3";;
 esac
-# Create encrypted container if using LUKS
+# Encrypt VM storage if using LUKS
 if [[ "$encrypt_type" == "luks" ]]; then
   cryptsetup luksFormat /dev/vdc1
   cryptsetup open /dev/vdc1 cryptvm
@@ -149,21 +159,24 @@ if [[ "$encrypt_type" == "luks" ]]; then
 else
   VM_DEV="/dev/vdc1"
 fi
-# ZFS pool for system
-zpool create -f $ZPOOL_OPTS rpool $STRAT ${DEVICES[@]}
-# ZFS pool for VM storage
-zpool create -f -o mountpoint=/var/lib/libvirt/images vm_pool $VM_DEV
-# Create root datasets
+# Create system ZFS pool
+ezpool create -f $ZPOOL_OPTS rpool $STRAT ${DEVICE_LIST[@]}
+# Create VM storage ZFS pool
+ezpool create -f -o mountpoint=/var/lib/libvirt/images vm_pool $VM_DEV
+# Create datasets
 zfs create -o mountpoint=/ rpool/ROOT
 zfs create -o mountpoint=/home rpool/HOME
+%end
 
 %post --interpreter=/usr/bin/bash
-```
-
-# Enable and start virtualization
-
-```
+# Enable services
 systemctl enable --now libvirtd.service
+systemctl enable --now openvswitch.service
+# Configure default OVS bridge
+ovs-vsctl add-br ovsbr0 || true
+nmcli connection add type ovs-bridge con-name ovsbr0 ifname ovsbr0 || true
+nmcli connection up ovsbr0 || true
+%end
 ```
 
 ---
@@ -171,35 +184,74 @@ systemctl enable --now libvirtd.service
 ## 6. Build the Custom ISO with Lorax
 
 1. **Prepare a Lorax Template**:
-   - Include your `ks.cfg`, custom Blivet plugin, and ZFS/LUKS repos in the tree.
-   - Reference these in the Lorax XML template.
+
+   * Include `ks.cfg`, Blivet plugin, and ZFS/LUKS repositories.
+   * Reference these in the Lorax XML template.
 2. **Run Lorax Composer**:
+
    ```bash
    lorax-composer --tree=/path/to/repo \
                   --ks=/path/to/ks.cfg \
-                  --product="AlmaLinux KVM Hypervisor ZFS SecureBoot" \
+                  --product="AlmaLinux KVM Hypervisor ZFS SecureBoot OVS" \
                   --version=8.9 \
                   --release=custom1 \
                   /path/to/output/
    ```
 
-* The ISO will be in `/path/to/output/images/`.
+   * The ISO will appear in `/path/to/output/images/`.
 
 ---
 
 ## 7. Integrate Secure Boot (Shim and MOK)
 
-1. **Include UEFI Boot Files**:
+This section explains how to include UEFI boot files in the ISO and enroll your MOK certificate:
 
-   * Place `shim.efi`, `grubx64.efi`, and `MOK.crt` under `EFI/BOOT/` in the ISO.
-2. **Enroll MOK Certificate**:
+1. **Prepare a directory for EFI files**:
 
    ```bash
-   mokutil --import MOK.crt
+   mkdir -p /tmp/iso-efi/EFI/BOOT
    ```
+2. **Copy shim, GRUB, and MOK certificate**:
 
-   * Reboot and follow the UEFI UI to enroll.
-3. **Verify**:
+   ```bash
+   cp /usr/share/shim/shimx64.efi /tmp/iso-efi/EFI/BOOT/shimx64.efi
+   cp /usr/share/grub2/x86_64-efi/grubx64.efi /tmp/iso-efi/EFI/BOOT/grubx64.efi
+   cp /path/to/MOK.crt /tmp/iso-efi/EFI/BOOT/MOK.crt
+   ```
+3. **Merge EFI files into the Lorax tree before ISO build**:
+
+   * If using a custom tree directory for Lorax (`--tree=/path/to/repo`), add:
+
+     ```bash
+     cp -r /tmp/iso-efi/EFI/BOOT /path/to/repo/EFI/
+     ```
+   * Ensure the Lorax template XML includes:
+
+     ```xml
+     <addon>
+       <name>EFI Files</name>
+       <type>file</type>
+       <source>/path/to/repo/EFI</source>
+       <dest>/EFI</dest>
+     </addon>
+     ```
+4. **Build the ISO**:
+
+   ```bash
+   lorax-composer --tree=/path/to/repo \
+                  --ks=/path/to/ks.cfg \
+                  ...
+   ```
+5. **Enroll MOK Certificate**:
+
+   * Boot from the ISO. At the shim prompt, press a key to enroll a new key.
+   * Run:
+
+     ```bash
+     mokutil --import MOK.crt
+     ```
+   * Reboot, select “Enroll MOK” from the blue screen, and follow prompts.
+6. **Verify enrollment and module signatures**:
 
    ```bash
    mokutil --list-enrolled
@@ -208,31 +260,24 @@ systemctl enable --now libvirtd.service
 
 ---
 
-## 8. Testing and Debugging
+## 8. Testing and Debugging Testing and Debugging
 
-* **Proxmox Reference**:
-
-  ```text
-  https://git.proxmox.com/git/pve-zfs.git
-  ```
 * **Dracut Debug**:
 
   ```bash
   dracut -f --regenerate-all --debug
   ```
-* **UEFI Shell**: Mount the ISO in EFI shell to confirm shim, GRUB, MOK.
+* **UEFI Shell**: Mount the ISO in an EFI shell to confirm shim, GRUB, and MOK certificate.
+* **Cockpit**: Access at `https://<host>:9090/` to manage VMs and OVS bridges.
 
 ---
 
 ### Summary
 
-1. Build host: `lorax`, `mock`, `dracut-devel`, virtualization tools, Blivet GUI.
+1. Build host: install `lorax`, `mock`, `dracut-devel`, virtualization and networking tools, Blivet GUI.
 2. Compile ZFS RPMs; create MOK keys; sign modules.
-3. Extend Anaconda GUI for ZFS, RAID, encryption.
-4. Kickstart: create ZFS pools, LUKS or ZFS encryption, VM storage pool.
-5. Build ISO with `lorax-composer` including hypervisor and custom UI.
+3. Extend Anaconda GUI for ZFS, RAID, and encryption.
+4. Kickstart: create encrypted ZFS pools, VM storage, and OVS bridge.
+5. Build ISO with `lorax-composer` including hypervisor and OVS.
 6. Embed shim/GRUB, enroll MOK for Secure Boot.
-7. Test: installation, encryption, KVM, signed modules.
-
-```
-```
+7. Test: installation flow, encryption, KVM, OVS, and Cockpit UI.
