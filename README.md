@@ -16,12 +16,13 @@ This document outlines the steps required to build a custom AlmaLinux ISO that:
 1. **Host System**: Use an AlmaLinux 8/9 VM or container matching your target OS version.
 2. **Install Required Packages**:
    ```bash
+   sudo dnf install -y centos-release-nfv-openvswitch epel-release
    sudo dnf update -y
-   sudo dnf install -y lorax-composer rpm-build mock \
-                       dracut-devel pesign mokutil git wget \
-                       anaconda-blivet-gui python3-blivet-gui python3-pykickstart \
+   sudo dnf install -y osbuild-composer composer-cli rpm-build mock \
+                       dracut-tools pesign mokutil git wget \
+                       python3-blivet pykickstart \
                        @virtualization\ host qemu-kvm libvirt libvirt-client virt-install \
-                       cockpit cockpit-machines cockpit-networkmanager openvswitch
+                       cockpit cockpit-machines cockpit-networkmanager openvswitch3.5
    ```
 
 3. **Enable and Start Services**:
