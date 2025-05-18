@@ -17,12 +17,14 @@ This document outlines the steps required to build a custom AlmaLinux ISO that:
 2. **Install Required Packages**:
    ```bash
    sudo dnf install -y centos-release-nfv-openvswitch epel-release
+   sudo dnf install -y https://zfsonlinux.org/epel/zfs-release-2-3$(rpm --eval "%{dist}").noarch.rpm
    sudo dnf update -y
    sudo dnf install -y osbuild-composer composer-cli rpm-build mock \
                        dracut-tools pesign mokutil git wget \
                        python3-blivet pykickstart \
                        @virtualization\ host qemu-kvm libvirt libvirt-client virt-install \
-                       cockpit cockpit-machines cockpit-networkmanager openvswitch3.5
+                       cockpit cockpit-machines cockpit-networkmanager openvswitch3.5 \
+                       kernel-devel zfs
    ```
 
 3. **Enable and Start Services**:
@@ -41,27 +43,6 @@ This document outlines the steps required to build a custom AlmaLinux ISO that:
    ```
 
    * You will enroll `MOK.crt` into the shim database during installation using MokEnroll.
-
----
-
-## 2. Download and Build ZFS Packages
-
-1. **Clone the ZFS-on-Linux Repository**:
-
-   ```bash
-   git clone https://github.com/openzfs/zfs.git
-   cd zfs
-   git checkout stable-2.1   # or the latest stable branch compatible with RHEL
-   ```
-2. **Generate RPM Packages**:
-
-   ```bash
-   ./autogen.sh
-   ./configure --prefix=/usr --with-config=kernel
-   make rpm
-   ```
-
-   * This produces `zfs-dkms`, `kmod-zfs`, and their dependencies.
 
 ---
 
